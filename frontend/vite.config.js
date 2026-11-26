@@ -1,16 +1,27 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
+const apiProxy = {
+  '/api': {
+    target: 'http://127.0.0.1:20001',
+    changeOrigin: true,
+  },
+}
+
 export default defineConfig({
   plugins: [vue()],
   server: {
-    host: '127.0.0.1',
-    port: 5173,
-    proxy: {
-      '/api': {
-        target: 'http://127.0.0.1:18000',
-        changeOrigin: true,
-      },
-    },
+    host: '0.0.0.0',
+    port: 30001,
+    strictPort: true,
+    allowedHosts: true,
+    proxy: apiProxy,
+  },
+  preview: {
+    host: '0.0.0.0',
+    port: 30001,
+    strictPort: true,
+    allowedHosts: true,
+    proxy: apiProxy,
   },
 })

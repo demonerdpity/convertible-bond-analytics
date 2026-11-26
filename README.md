@@ -35,7 +35,7 @@
 ```powershell
 cd backend
 uv sync
-uv run uvicorn app.main:app --host 127.0.0.1 --port 18000 --reload
+uv run uvicorn app.main:app --host 0.0.0.0 --port 20001 --reload
 ```
 
 ### 2. 启动前端（Vue 3 + Vite）
@@ -46,6 +46,6 @@ npm install
 npm run dev
 ```
 
-打开浏览器访问 `http://127.0.0.1:5173`，页面默认不加载数据，点击 **「获取数据」** 即可发起一次全量请求。
+打开浏览器访问 `http://127.0.0.1:30001`（前端 `30001` 自动将 `/api` 代理到后端 `20001`），页面默认不加载数据，点击 **「获取数据」** 即可发起一次全量请求。
 
-> 生产构建：`cd frontend && npm run build` 后，直接运行后端并访问 `http://127.0.0.1:18000` 即可同时提供前端页面与 API。
+> 生产运行：`cd frontend && npm run build && npm run preview`（默认监听 `30001` 并代理 `/api` 到 `20001`），也可直接访问后端 `20001` 端口。
