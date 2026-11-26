@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -11,6 +12,8 @@ from typing import Any
 import httpx
 
 from app.models import BondListResponse, ConvertibleBond
+
+logger = logging.getLogger(__name__)
 
 EASTMONEY_DC_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q="
@@ -86,12 +89,46 @@ DC_MAX_PAGES = 5
 TENCENT_BATCH_SIZE = 60
 PAGE_DELAY_SECONDS = 0.3
 COOLDOWN_SECONDS = 30.0
+REQUEST_TIMEOUT = httpx.Timeout(30.0, connect=15.0)
+RETRY_ATTEMPTS = 1
+RETRY_DELAY_SECONDS = 1.5
 CN_TZ = timezone(timedelta(hours=8))
 CACHE_FILE = Path(__file__).resolve().parents[2] / "data" / "latest_bonds.json"
 
 
 class EastmoneyFetchError(RuntimeError):
     """Raised when upstream convertible bond data cannot be fetched or parsed."""
+
+
+async def _get_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+) -> httpx.Response:
+    last_exc: Exception | None = None
+    for attempt in range(RETRY_ATTEMPTS + 1):
+        try:
+            resp = await client.get(url, params=params, headers=headers)
+            resp.raise_for_status()
+            return resp
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            last_exc = exc
+            if attempt < RETRY_ATTEMPTS:
+                logger.warning(
+                    "Transient network error fetching %s (attempt %d/%d): %s; retrying in %.1fs",
+                    url,
+                    attempt + 1,
+                    RETRY_ATTEMPTS + 1,
+                    exc,
+                    RETRY_DELAY_SECONDS,
+                )
+                await asyncio.sleep(RETRY_DELAY_SECONDS)
+            else:
+                raise
+    assert last_exc is not None
+    raise last_exc
 
 
 def _to_float(value: Any) -> float | None:
@@ -250,8 +287,9 @@ async def _fetch_tencent_quotes(
     for i in range(0, len(unique_symbols), TENCENT_BATCH_SIZE):
         batch = unique_symbols[i : i + TENCENT_BATCH_SIZE]
         url = TENCENT_QUOTE_URL + ",".join(batch)
-        resp = await client.get(url, headers={"User-Agent": COMMON_HEADERS["User-Agent"]})
-        resp.raise_for_status()
+        resp = await _get_with_retry(
+            client, url, headers={"User-Agent": COMMON_HEADERS["User-Agent"]}
+        )
         text = resp.content.decode("gbk", errors="replace")
         for line in text.splitlines():
             line = line.strip()
@@ -431,7 +469,7 @@ class ConvertibleBondStore:
             try:
                 async with httpx.AsyncClient(
                     headers=COMMON_HEADERS,
-                    timeout=httpx.Timeout(15.0, connect=8.0),
+                    timeout=REQUEST_TIMEOUT,
                     http2=False,
                     trust_env=True,
                 ) as client:
@@ -449,8 +487,7 @@ class ConvertibleBondStore:
                             "source": "WEB",
                             "client": "WEB",
                         }
-                        resp = await client.get(EASTMONEY_DC_URL, params=params)
-                        resp.raise_for_status()
+                        resp = await _get_with_retry(client, EASTMONEY_DC_URL, params=params)
                         payload = resp.json()
                         if not isinstance(payload, dict) or not payload.get("success"):
                             msg = payload.get("message") if isinstance(payload, dict) else "未知错误"
@@ -503,11 +540,14 @@ class ConvertibleBondStore:
                         except httpx.HTTPError:
                             # 补充源失败不阻断主流程
                             tencent_quotes = {}
-            except EastmoneyFetchError:
+            except EastmoneyFetchError as exc:
+                logger.warning("Eastmoney fetch failed: %s", exc)
                 raise
             except httpx.HTTPError as exc:
-                raise EastmoneyFetchError(f"请求东方财富数据中心失败：{exc}") from exc
+                logger.warning("Eastmoney HTTP error (%s): %s", type(exc).__name__, exc)
+                raise EastmoneyFetchError(f"请求东方财富数据中心失败（{type(exc).__name__}）：{exc}") from exc
             except Exception as exc:
+                logger.exception("Unexpected error parsing convertible bond data")
                 raise EastmoneyFetchError(f"解析可转债数据失败：{exc}") from exc
 
             items = [
