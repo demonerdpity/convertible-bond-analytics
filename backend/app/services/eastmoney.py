@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -86,9 +86,19 @@ DEFAULT_DISCOUNT_RATE = 0.0280
 
 DC_PAGE_SIZE = 500
 DC_MAX_PAGES = 5
-TENCENT_BATCH_SIZE = 60
+TENCENT_BATCH_SIZE = 80
+TENCENT_BATCH_DELAY_SECONDS = 0.15
 PAGE_DELAY_SECONDS = 0.3
-COOLDOWN_SECONDS = 30.0
+
+# 分级刷新节律（兼顾实时性与低风控）：
+# - 基础与条款数据（datacenter-web）：盘中每 15 分钟刷新一次，收盘后补一次收盘定格
+# - 实时行情报价（qt.gtimg.cn）：仅盘中每 45 秒刷新一次；午休/盘后/周末停止上游请求
+# - 手动刷新防抖冷却：20 秒内复用当前缓存
+BASE_REFRESH_INTERVAL_SECONDS = 900
+QUOTE_REFRESH_INTERVAL_SECONDS = 45
+MANUAL_COOLDOWN_SECONDS = 20.0
+SCHEDULER_TICK_SECONDS = 15
+
 REQUEST_TIMEOUT = httpx.Timeout(30.0, connect=15.0)
 RETRY_ATTEMPTS = 1
 RETRY_DELAY_SECONDS = 1.5
@@ -98,6 +108,26 @@ CACHE_FILE = Path(__file__).resolve().parents[2] / "data" / "latest_bonds.json"
 
 class EastmoneyFetchError(RuntimeError):
     """Raised when upstream convertible bond data cannot be fetched or parsed."""
+
+
+def is_cn_trading_time(now: datetime | None = None) -> bool:
+    """判断当前是否处于 A 股可转债盘中交易窗口（周一至周五 09:20-11:32、12:58-15:05）。"""
+    dt = now or datetime.now(CN_TZ)
+    if dt.weekday() >= 5:
+        return False
+    t = dt.time()
+    morning = dt_time(9, 20) <= t <= dt_time(11, 32)
+    afternoon = dt_time(12, 58) <= t <= dt_time(15, 5)
+    return morning or afternoon
+
+
+def is_post_close_sync_window(now: datetime | None = None) -> bool:
+    """收盘定格窗口（工作日 15:05-15:20），确保盘后数据为当日最终收盘价。"""
+    dt = now or datetime.now(CN_TZ)
+    if dt.weekday() >= 5:
+        return False
+    t = dt.time()
+    return dt_time(15, 5) < t <= dt_time(15, 20)
 
 
 async def _get_with_retry(
@@ -135,10 +165,9 @@ def _to_float(value: Any) -> float | None:
     if value is None or value == "" or value == "-":
         return None
     try:
-        num = float(value)
+        return float(value)
     except (TypeError, ValueError):
         return None
-    return num
 
 
 def _to_str(value: Any) -> str | None:
@@ -217,7 +246,6 @@ def _add_years(base: date, years: int) -> date:
     try:
         return base.replace(year=base.year + years)
     except ValueError:
-        # 处理闰年 2 月 29 日
         return base.replace(year=base.year + years, day=28)
 
 
@@ -253,7 +281,6 @@ def _compute_pure_bond_value(
         if pay_dt <= today:
             continue
         t_years = (pay_dt - today).days / 365.0
-        # 到期赎回价通常已包含最后一期票面利息
         cash_flow = redemption_price if idx == total_years else coupon
         pv += cash_flow / ((1.0 + discount_rate) ** t_years)
 
@@ -277,11 +304,52 @@ def _compute_conversion_market_value_per_100(
     return None
 
 
+def _recalculate_derived_fields(bond: ConvertibleBond) -> ConvertibleBond:
+    """当现价/正股价更新后，重新计算转股价值、溢价率与每百元现价转股市值。"""
+    conversion_value = bond.conversion_value
+    if (
+        bond.stock_price is not None
+        and bond.stock_price > 0
+        and bond.conversion_price is not None
+        and bond.conversion_price > 0
+    ):
+        conversion_value = round((100.0 / bond.conversion_price) * bond.stock_price, 4)
+
+    conversion_premium_pct = bond.conversion_premium_pct
+    if (
+        bond.bond_price is not None
+        and conversion_value is not None
+        and conversion_value > 0
+    ):
+        conversion_premium_pct = round((bond.bond_price / conversion_value - 1.0) * 100.0, 2)
+
+    pure_bond_premium_pct = bond.pure_bond_premium_pct
+    if (
+        bond.bond_price is not None
+        and bond.pure_bond_value is not None
+        and bond.pure_bond_value > 0
+    ):
+        pure_bond_premium_pct = round((bond.bond_price / bond.pure_bond_value - 1.0) * 100.0, 2)
+
+    per_100 = _compute_conversion_market_value_per_100(
+        bond.bond_price, bond.stock_price, bond.conversion_price
+    )
+
+    return bond.model_copy(
+        update={
+            "conversion_value": conversion_value,
+            "conversion_premium_pct": conversion_premium_pct,
+            "pure_bond_premium_pct": pure_bond_premium_pct,
+            "conversion_market_value_per_100": per_100,
+        }
+    )
+
+
 async def _fetch_tencent_quotes(
     client: httpx.AsyncClient,
     symbols: list[str],
 ) -> dict[str, tuple[float | None, float | None]]:
-    """Batch-fetch (latest_price, change_pct) from Tencent qt.gtimg.cn as fallback/supplement."""
+    """Batch-fetch (latest_price, change_pct) from Tencent qt.gtimg.cn."""
     result: dict[str, tuple[float | None, float | None]] = {}
     unique_symbols = list(dict.fromkeys(symbols))
     for i in range(0, len(unique_symbols), TENCENT_BATCH_SIZE):
@@ -305,7 +373,7 @@ async def _fetch_tencent_quotes(
             if price is not None and price > 0:
                 result[sym] = (price, chg_pct)
         if i + TENCENT_BATCH_SIZE < len(unique_symbols):
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(TENCENT_BATCH_DELAY_SECONDS)
     return result
 
 
@@ -320,7 +388,6 @@ def _parse_dc_row(
         return None
 
     secucode = _to_str(row.get("SECUCODE"))
-    # 过滤退市转三板(.NQ)等非沪深交易所可转债
     if secucode and not secucode.upper().endswith((".SH", ".SZ")):
         return None
 
@@ -337,7 +404,6 @@ def _parse_dc_row(
     stock_price = _to_float(row.get("CONVERT_STOCK_PRICE"))
     stock_change_pct = _to_float(row.get("STOCK_CHG"))
 
-    # 如数据中心未带出实时价，则用腾讯批量行情补全
     if is_listed and bond_price is None:
         b_sym = _qt_symbol(bond_code, bond_market)
         if b_sym and b_sym in tencent_quotes:
@@ -413,19 +479,30 @@ def _parse_dc_row(
 
 
 class ConvertibleBondStore:
-    """In-memory + local JSON snapshot store powered by datacenter-web + Tencent quote fallback."""
+    """Tiered auto-refresh snapshot store:
+    - Full base/clause sync via datacenter-web (every 15m in trading hours + post-close)
+    - Fast live quote sync via Tencent qt.gtimg.cn (every 45s in trading hours only)
+    - Atomic replacement: failed refreshes never overwrite valid data.
+    """
 
     def __init__(self, cache_file: Path = CACHE_FILE) -> None:
         self._cache_file = cache_file
         self._snapshot = BondListResponse(
             total=0,
             fetched_at=None,
+            base_fetched_at=None,
             source="datacenter-web.eastmoney.com",
             pages_fetched=0,
+            is_trading_time=is_cn_trading_time(),
+            quote_refresh_seconds=QUOTE_REFRESH_INTERVAL_SECONDS,
+            base_refresh_seconds=BASE_REFRESH_INTERVAL_SECONDS,
             items=[],
         )
-        self._last_fetch_epoch: float = 0.0
+        self._last_base_epoch: float = 0.0
+        self._last_quote_epoch: float = 0.0
+        self._post_close_synced_date: str | None = None
         self._lock = asyncio.Lock()
+        self._scheduler_task: asyncio.Task[None] | None = None
         self._load_disk_cache()
 
     def _load_disk_cache(self) -> None:
@@ -435,8 +512,19 @@ class ConvertibleBondStore:
             raw = json.loads(self._cache_file.read_text(encoding="utf-8"))
             cached = BondListResponse.model_validate(raw)
             if cached.total > 0:
-                self._snapshot = cached.model_copy(update={"from_cache": True})
-                self._last_fetch_epoch = self._cache_file.stat().st_mtime
+                mtime = self._cache_file.stat().st_mtime
+                base_at = cached.base_fetched_at or cached.fetched_at
+                self._snapshot = cached.model_copy(
+                    update={
+                        "base_fetched_at": base_at,
+                        "from_cache": True,
+                        "is_trading_time": is_cn_trading_time(),
+                        "quote_refresh_seconds": QUOTE_REFRESH_INTERVAL_SECONDS,
+                        "base_refresh_seconds": BASE_REFRESH_INTERVAL_SECONDS,
+                    }
+                )
+                self._last_base_epoch = mtime
+                self._last_quote_epoch = mtime
         except Exception:
             return
 
@@ -451,13 +539,147 @@ class ConvertibleBondStore:
             return
 
     def get_snapshot(self) -> BondListResponse:
-        return self._snapshot
+        return self._snapshot.model_copy(
+            update={
+                "is_trading_time": is_cn_trading_time(),
+                "quote_refresh_seconds": QUOTE_REFRESH_INTERVAL_SECONDS,
+                "base_refresh_seconds": BASE_REFRESH_INTERVAL_SECONDS,
+            }
+        )
 
-    async def fetch_once(self) -> BondListResponse:
+    def start_background_refresh(self) -> None:
+        if self._scheduler_task is None or self._scheduler_task.done():
+            self._scheduler_task = asyncio.create_task(self._scheduler_loop())
+
+    async def stop_background_refresh(self) -> None:
+        if self._scheduler_task is not None and not self._scheduler_task.done():
+            self._scheduler_task.cancel()
+            try:
+                await self._scheduler_task
+            except asyncio.CancelledError:
+                pass
+        self._scheduler_task = None
+
+    async def _scheduler_loop(self) -> None:
+        # 启动后如果尚无缓存数据，立即拉取一次全量快照，避免首次进入为空白
+        if self._snapshot.total == 0:
+            try:
+                logger.info("Initial cache empty; fetching full convertible bond snapshot...")
+                await self.fetch_full(ignore_cooldown=True)
+            except Exception as exc:
+                logger.warning("Initial startup fetch failed: %s", exc)
+
+        while True:
+            try:
+                await asyncio.sleep(SCHEDULER_TICK_SECONDS)
+                now_dt = datetime.now(CN_TZ)
+                now_epoch = time.time()
+                today_str = now_dt.date().isoformat()
+
+                if self._snapshot.total == 0:
+                    # 尚无有效数据时，每隔 60 秒重试一次初始化拉取
+                    if now_epoch - self._last_base_epoch >= 60:
+                        await self.fetch_full(ignore_cooldown=True)
+                    continue
+
+                if is_cn_trading_time(now_dt):
+                    if now_epoch - self._last_base_epoch >= BASE_REFRESH_INTERVAL_SECONDS:
+                        logger.info("Scheduled trading-hour full base refresh...")
+                        await self.fetch_full(ignore_cooldown=True)
+                    elif now_epoch - self._last_quote_epoch >= QUOTE_REFRESH_INTERVAL_SECONDS:
+                        logger.info("Scheduled trading-hour live quote refresh...")
+                        await self.refresh_quotes_only()
+                elif (
+                    is_post_close_sync_window(now_dt)
+                    and self._post_close_synced_date != today_str
+                ):
+                    logger.info("Post-close final snapshot sync for %s...", today_str)
+                    await self.fetch_full(ignore_cooldown=True)
+                    self._post_close_synced_date = today_str
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Background refresh cycle failed (keeping existing snapshot): %s", exc)
+
+    async def refresh_quotes_only(self) -> BondListResponse:
+        """仅使用腾讯批量行情更新已上市转债和正股的实时价格，并本地重算衍生指标。"""
+        async with self._lock:
+            if self._snapshot.total == 0:
+                raise EastmoneyFetchError("尚未加载基础数据，请先执行全量拉取")
+
+            today_str = datetime.now(CN_TZ).date().isoformat()
+            symbols: list[str] = []
+            for item in self._snapshot.items:
+                is_listed = bool(item.listing_date and item.listing_date <= today_str)
+                if is_listed:
+                    b_sym = _qt_symbol(item.bond_code, item.bond_market)
+                    if b_sym:
+                        symbols.append(b_sym)
+                s_sym = _qt_symbol(item.stock_code, item.stock_market)
+                if s_sym:
+                    symbols.append(s_sym)
+
+            if not symbols:
+                return self.get_snapshot()
+
+            try:
+                async with httpx.AsyncClient(
+                    headers={"User-Agent": COMMON_HEADERS["User-Agent"]},
+                    timeout=REQUEST_TIMEOUT,
+                    http2=False,
+                    trust_env=True,
+                ) as client:
+                    quotes = await _fetch_tencent_quotes(client, symbols)
+            except httpx.HTTPError as exc:
+                logger.warning("Tencent quote refresh failed (%s): %s", type(exc).__name__, exc)
+                raise EastmoneyFetchError(f"刷新实时行情失败（{type(exc).__name__}）：{exc}") from exc
+
+            if not quotes:
+                raise EastmoneyFetchError("实时行情返回为空，已保留旧数据")
+
+            updated_items: list[ConvertibleBond] = []
+            for item in self._snapshot.items:
+                is_listed = bool(item.listing_date and item.listing_date <= today_str)
+                updates: dict[str, Any] = {}
+                if is_listed:
+                    b_sym = _qt_symbol(item.bond_code, item.bond_market)
+                    if b_sym and b_sym in quotes:
+                        b_price, b_chg = quotes[b_sym]
+                        updates["bond_price"] = b_price
+                        updates["bond_change_pct"] = b_chg
+                s_sym = _qt_symbol(item.stock_code, item.stock_market)
+                if s_sym and s_sym in quotes:
+                    s_price, s_chg = quotes[s_sym]
+                    updates["stock_price"] = s_price
+                    updates["stock_change_pct"] = s_chg
+
+                next_item = item.model_copy(update=updates) if updates else item
+                updated_items.append(_recalculate_derived_fields(next_item))
+
+            now_str = datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+            self._snapshot = self._snapshot.model_copy(
+                update={
+                    "fetched_at": now_str,
+                    "source": "datacenter-web.eastmoney.com + qt.gtimg.cn",
+                    "from_cache": False,
+                    "is_trading_time": is_cn_trading_time(),
+                    "items": updated_items,
+                }
+            )
+            self._last_quote_epoch = time.time()
+            self._save_disk_cache(self._snapshot)
+            return self._snapshot
+
+    async def fetch_full(self, *, ignore_cooldown: bool = False) -> BondListResponse:
+        """执行全量数据中心拉取（含缺失现价腾讯补缺）；只有成功拿到非空数据时才替换旧快照。"""
         async with self._lock:
             now = time.time()
-            if self._snapshot.total > 0 and (now - self._last_fetch_epoch) < COOLDOWN_SECONDS:
-                return self._snapshot.model_copy(update={"from_cache": True})
+            if (
+                not ignore_cooldown
+                and self._snapshot.total > 0
+                and (now - max(self._last_base_epoch, self._last_quote_epoch)) < MANUAL_COOLDOWN_SECONDS
+            ):
+                return self.get_snapshot().model_copy(update={"from_cache": True})
 
             today = datetime.now(CN_TZ).date()
             today_str = today.isoformat()
@@ -513,7 +735,6 @@ class ConvertibleBondStore:
                             break
                         await asyncio.sleep(PAGE_DELAY_SECONDS)
 
-                    # 检查是否有已上市转债或正股缺少实时价，若有则用腾讯批量行情补充
                     missing_symbols: list[str] = []
                     for item in raw_rows:
                         code = _to_str(item.get("SECURITY_CODE"))
@@ -538,14 +759,15 @@ class ConvertibleBondStore:
                             tencent_quotes = await _fetch_tencent_quotes(client, missing_symbols)
                             used_tencent = bool(tencent_quotes)
                         except httpx.HTTPError:
-                            # 补充源失败不阻断主流程
                             tencent_quotes = {}
             except EastmoneyFetchError as exc:
                 logger.warning("Eastmoney fetch failed: %s", exc)
                 raise
             except httpx.HTTPError as exc:
                 logger.warning("Eastmoney HTTP error (%s): %s", type(exc).__name__, exc)
-                raise EastmoneyFetchError(f"请求东方财富数据中心失败（{type(exc).__name__}）：{exc}") from exc
+                raise EastmoneyFetchError(
+                    f"请求东方财富数据中心失败（{type(exc).__name__}）：{exc}"
+                ) from exc
             except Exception as exc:
                 logger.exception("Unexpected error parsing convertible bond data")
                 raise EastmoneyFetchError(f"解析可转债数据失败：{exc}") from exc
@@ -555,6 +777,9 @@ class ConvertibleBondStore:
                 for raw in raw_rows
                 if (bond := _parse_dc_row(raw, today, tencent_quotes)) is not None
             ]
+            if not items:
+                raise EastmoneyFetchError("上游返回有效可转债数量为 0，已保留旧数据")
+
             fetched_at = datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
             source_label = (
                 "datacenter-web.eastmoney.com + qt.gtimg.cn"
@@ -564,14 +789,24 @@ class ConvertibleBondStore:
             self._snapshot = BondListResponse(
                 total=len(items),
                 fetched_at=fetched_at,
+                base_fetched_at=fetched_at,
                 source=source_label,
                 pages_fetched=pages_fetched,
                 from_cache=False,
+                is_trading_time=is_cn_trading_time(),
+                quote_refresh_seconds=QUOTE_REFRESH_INTERVAL_SECONDS,
+                base_refresh_seconds=BASE_REFRESH_INTERVAL_SECONDS,
                 items=items,
             )
-            self._last_fetch_epoch = time.time()
+            now_epoch = time.time()
+            self._last_base_epoch = now_epoch
+            self._last_quote_epoch = now_epoch
             self._save_disk_cache(self._snapshot)
             return self._snapshot
+
+    async def fetch_once(self) -> BondListResponse:
+        """兼容手动触发入口。"""
+        return await self.fetch_full(ignore_cooldown=False)
 
 
 bond_store = ConvertibleBondStore()
